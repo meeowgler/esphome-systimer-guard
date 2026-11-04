@@ -5,7 +5,7 @@ An ESPHome external component that works around the ESP32-C6 SYSTIMER fault desc
 the counter behind `esp_timer` (SYSTIMER counter 0) suddenly loses minutes to hours, and its
 snapshot handshake can wedge.
 
-**Status: experimental.** It has corrected 13 real events on 3 boards so far (see [Results](#results)).
+**Status: experimental.** It has corrected 16 real events on 3 boards so far (see [Results](#results)).
 Use it only if your C6 boards show the symptoms below, and please report how it behaves.
 
 ## Related work
@@ -55,11 +55,37 @@ never be larger than the counter's own value.
   `last_event` sensor records exact raw values instead.
 - **Below bit 26:** the 4.079 s and 0.491 s events lie entirely below bit 26, outside the two
   bit groups (26 to 35 and 36 to 51) seen in the raw captures on the upstream issue.
-- **To 3 November 2026:** 13 real events on 3 of 12 boards since the guard went on all of them
-  on 25 October, all corrected; 10 were on the worst board, 8 of those with power saving off.
-  No stalls, no snapshot recoveries, and counter 1 never moved backward.
 - **Since 3 November 2026** the worst board runs with `load_canary` and `last_event` (see
   [Options](#options)), to record raw values for the upstream issue.
+- **4 November 2026, first raw captures, all on the worst board.** Counter 0 lost time three
+  times. The load registers held the canary each time, and none of its bits turned up:
+  - 67.109 s: only bit 30 cleared; bits 27, 33, 34 and 35 in the same group stayed set.
+  - 1547.698 s: bits 26 to 35 all cleared (26, 30, 31, 32 and 34 were set).
+  - 4261.413 s: bits 26 to 35 all cleared (29 to 35 were set).
+
+  Had the 26-to-35 group been loaded from the load registers, it would have come back with the
+  canary's bits 26, 29, 31, 32 and 34 set. It came back zero, so these were clears, not
+  spurious loads, and the first was not a whole group.
+- **4 November 2026, counter 1 loses time too.** Two captures first logged as `ahead` (35 ms
+  and 94 ms) were counter 1 losing time, not counter 0 jumping forward. When counter 1 loses
+  time, the FreeRTOS tick waits for it to count back up to its next alarm, so between two checks
+  counter 1 still moves 1 ms while counter 0 moves the real time; counter 1 never looks as if it
+  went backward. The first lost exactly bits 15 and 19 (557,056 ticks, to within 80 ticks); the
+  second about 94 ms, which fits bits 0 to 20 cleared. Since 4 November the guard reads the RTC
+  timer as a third clock to tell the two cases apart, and counts these as tick counter jumps.
+- **To 4 November 2026:** 16 real events on counter 0 on 3 of 12 boards since the guard went on
+  all of them on 25 October, all corrected; 13 were on the worst board. Counter 1 lost time
+  twice, both on the worst board. No stalls and no snapshot recoveries.
+
+  The raw captures (counter values in 16 MHz ticks):
+
+  ```
+  lost 67.109 s;   u0 0x0001e49ebf020 -> 0x0001e09ec2ea0; u1 0x0001e49eb6b95 -> 0x0001e49ebaa15; load 0x5a5a5a5a5a5a5
+  lost 1547.698 s; u0 0x00055c4acf705 -> 0x0005000ad356a; u1 0x00055c4ac7329 -> 0x00055c4acb196; load 0x5a5a5a5a5a5a5
+  lost 4261.413 s; u0 0x0008fe3bc4452 -> 0x0008003bc826f; u1 0x0008fe3bbc1bc -> 0x0008fe3bc0016; load 0x5a5a5a5a5a5a5
+  ahead 0.035 s;   u0 0x000ef9fe908a1 -> 0x000ef9ff1c789; u1 0x000ef9fe88795 -> 0x000ef9fe8c62d; load 0x5a5a5a5a5a5a5
+  ahead 0.094 s;   u0 0x000fa551fb884 -> 0x000fa5536da36; u1 0x000fa5516b796 -> 0x000fa5516f68b; load 0x5a5a5a5a5a5a5
+  ```
 - Simulated 600 s jumps (see [Testing it](#testing-it)) are corrected to the millisecond.
 - A simulated wedged handshake (`simulate_wedge()`) ends in an abort about a second later, and
   the board restarts with an `Abort` crash record and reset reason "exception/panic".
@@ -91,8 +117,10 @@ the `esp_timer` alarm, so timers that fell due in the meantime run at once.
   never touched.
 - A counter that stops, rather than jumps back, is stepped forward until it runs again;
   corrections less than a second apart count as one event.
-- If counter 1 itself goes backward, the guard re-learns the offset and counts it as a
-  "tick counter jump" instead of acting.
+- If counter 1 itself loses time, the guard re-learns the offset and counts it as a "tick
+  counter jump" instead of acting. A counter 1 loss usually looks like `esp_timer` jumping
+  ahead, because the tick waits for counter 1 to catch up, so the guard checks the RTC timer to
+  see which counter moved.
 
 ### A wedged snapshot handshake
 
@@ -151,14 +179,16 @@ systimer_guard:
   also publish at once after any event.
 - **corrections** (*Optional*, sensor): number of correction events since boot.
 - **time_recovered** (*Optional*, sensor, seconds): total time put back since boot.
-- **tick_counter_jumps** (*Optional*, sensor): how often counter 1 went backward. Non-zero
-  would mean the fault is not limited to counter 0.
+- **tick_counter_jumps** (*Optional*, sensor): how often counter 1 lost time. The fault hits
+  counter 1 too (see [Results](#results)).
 - **snapshot_recoveries** (*Optional*, sensor): reads that only succeeded after the snapshot
   was re-requested.
-- **last_event** (*Optional*, text sensor): the raw values around the latest event: counter 0
-  and counter 1 at the check before and the check that caught it, counter 0's load registers,
-  and which bits of counter 0 differ from where it should be (the XOR; its lowest few bits also
-  carry the read delay). Each event is logged as a warning too, as `Raw capture: ...`.
+- **last_event** (*Optional*, text sensor): the raw values around the latest event: what
+  happened (`lost`, `ahead` or `tick counter lost`), counter 0 and counter 1 at the check before
+  and the check that caught it, counter 0's load registers, which bits of counter 0 differ from
+  where it should be (the XOR; its lowest few bits also carry the read delay), and the time
+  between the two checks by the RTC timer. Each event is logged as a warning too, as
+  `Raw capture: ...`.
 - **load_canary** (*Optional*, boolean, default `false`): keep the pattern `0x5A5A5A5A5A5A5`
   in counter 0's load registers, as Espressif asked in
   [esp-idf#19036](https://github.com/espressif/esp-idf/issues/19036). If an event loads part of

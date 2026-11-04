@@ -6,10 +6,12 @@
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_private/esp_clk.h>
 #include <esp_private/esp_timer_private.h>
 #include <esp_private/systimer.h>
 #include <hal/systimer_ll.h>
 #include <sdkconfig.h>
+#include <soc/rtc.h>
 #include <soc/systimer_struct.h>
 #include "esphome/core/log.h"
 
@@ -133,6 +135,12 @@ void SystimerGuard::run_() {
   int64_t base = INT64_MAX;
   uint64_t prev_tick_us = 0;
   uint64_t prev_tick_ticks = 0, prev_timer_ticks = 0;
+  // A third clock, the RTC timer (slow clock), tells which counter moved when esp_timer seems to
+  // jump ahead: counter 0 stepping forward, or counter 1 losing time. A tick counter that loses
+  // time does not show as going backward here, because the tick (and with it this task) then
+  // waits for it to count back up to its next alarm.
+  uint64_t prev_rtc_cycles = 0;
+  const uint32_t slowclk_cal = esp_clk_slowclk_cal_get();
   uint64_t last_correction_tick_us = 0;
   uint32_t failed_checks = 0;
   const int64_t threshold = this->threshold_us_;
@@ -153,6 +161,7 @@ void SystimerGuard::run_() {
       continue;
     }
     failed_checks = 0;
+    uint64_t rtc_cycles = rtc_time_get();
     if (read == ReadResult::RECOVERED)
       this->snapshot_recoveries_.fetch_add(1, std::memory_order_relaxed);
     if (prev_tick_us != 0 && tick_us < prev_tick_us) {
@@ -162,6 +171,7 @@ void SystimerGuard::run_() {
       prev_tick_us = tick_us;
       prev_tick_ticks = tick_ticks;
       prev_timer_ticks = timer_ticks;
+      prev_rtc_cycles = rtc_cycles;
       continue;
     }
     prev_tick_us = tick_us;
@@ -174,7 +184,8 @@ void SystimerGuard::run_() {
       // jumps is stepped forward every few milliseconds until it runs again).
       bool new_event = last_correction_tick_us == 0 || tick_us - last_correction_tick_us > 1000000;
       if (new_event)
-        this->record_capture_(lost, prev_timer_ticks, timer_ticks, prev_tick_ticks, tick_ticks);
+        this->record_capture_(EventKind::LOST, lost, prev_timer_ticks, timer_ticks, prev_tick_ticks, tick_ticks,
+                              int64_t(rtc_time_slowclk_to_us(rtc_cycles - prev_rtc_cycles, slowclk_cal)));
       esp_timer_private_advance(lost);
       this->write_canary_();
       esp_timer_start_once(this->kick_timer_, 1);
@@ -188,21 +199,32 @@ void SystimerGuard::run_() {
       last_correction_tick_us = tick_us;
       this->recovered_ms_.fetch_add(lost_ms, std::memory_order_relaxed);
     } else if (offset - base > threshold) {
-      // esp_timer ahead of the tick counter: not the known fault. Re-learn rather than act, but
-      // record it (a spurious load of the canary could move the counter forward).
-      this->record_capture_(base - offset, prev_timer_ticks, timer_ticks, prev_tick_ticks, tick_ticks);
+      // esp_timer ahead of the tick counter. Whichever counter moved, re-learn rather than act:
+      // a tick counter that lost time needs no repair, and stepping esp_timer back is unsafe.
+      // The RTC timer says which it was; record it (a spurious load of the canary could move
+      // counter 0 forward).
+      int64_t rtc_us = int64_t(rtc_time_slowclk_to_us(rtc_cycles - prev_rtc_cycles, slowclk_cal));
+      int64_t timer_step = int64_t(systimer_ticks_to_us(timer_ticks - prev_timer_ticks));
+      int64_t tick_step = int64_t(systimer_ticks_to_us(tick_ticks - prev_tick_ticks));
+      bool tick_lost = prev_rtc_cycles != 0 && std::llabs(timer_step - rtc_us) < std::llabs(tick_step - rtc_us);
+      if (tick_lost)
+        this->tick_counter_jumps_.fetch_add(1, std::memory_order_relaxed);
+      this->record_capture_(tick_lost ? EventKind::TICK_LOST : EventKind::AHEAD, offset - base, prev_timer_ticks,
+                            timer_ticks, prev_tick_ticks, tick_ticks, rtc_us);
       base = offset;
     }
     prev_tick_ticks = tick_ticks;
     prev_timer_ticks = timer_ticks;
+    prev_rtc_cycles = rtc_cycles;
   }
 }
 
-void SystimerGuard::record_capture_(int64_t delta_us, uint64_t timer_before, uint64_t timer_after,
-                                    uint64_t tick_before, uint64_t tick_after) {
+void SystimerGuard::record_capture_(EventKind kind, int64_t delta_us, uint64_t timer_before, uint64_t timer_after,
+                                    uint64_t tick_before, uint64_t tick_after, int64_t rtc_us) {
   if (timer_before == 0 || this->capture_pending_.load(std::memory_order_acquire))
     return;  // no earlier reading yet, or the last capture is not reported yet
-  this->capture_ = Capture{delta_us, timer_before, timer_after, tick_before, tick_after, read_load_value()};
+  this->capture_ =
+      Capture{kind, delta_us, timer_before, timer_after, tick_before, tick_after, read_load_value(), rtc_us};
   this->capture_pending_.store(true, std::memory_order_release);
 }
 
@@ -233,14 +255,16 @@ void SystimerGuard::loop() {
     const Capture c = this->capture_;
     this->capture_pending_.store(false, std::memory_order_release);
     // Counter 0 should have moved exactly as far as counter 1 between the two readings; the
-    // XOR shows which bits differ from that (the lowest few also carry the read delay).
+    // XOR shows which bits differ from that (the lowest few also carry the read delay). After a
+    // tick counter loss it is counter 1 that is off, so compare the counters' steps instead.
     uint64_t expected = (c.timer_before + (c.tick_after - c.tick_before)) & COUNTER_MASK;
+    const char *what = c.kind == EventKind::LOST ? "lost" : c.kind == EventKind::AHEAD ? "ahead" : "tick counter lost";
     char buf[256];
     snprintf(buf, sizeof(buf),
              "%s %.3f s; u0 0x%013" PRIx64 " -> 0x%013" PRIx64 "; u1 0x%013" PRIx64 " -> 0x%013" PRIx64
-             "; load 0x%013" PRIx64 "; xor 0x%013" PRIx64,
-             c.delta_us >= 0 ? "lost" : "ahead", std::llabs(c.delta_us) / 1e6, c.timer_before, c.timer_after,
-             c.tick_before, c.tick_after, c.load, expected ^ c.timer_after);
+             "; load 0x%013" PRIx64 "; xor 0x%013" PRIx64 "; rtc %.1f ms",
+             what, c.delta_us / 1e6, c.timer_before, c.timer_after, c.tick_before, c.tick_after, c.load,
+             expected ^ c.timer_after, c.rtc_us / 1e3);
     ESP_LOGW(TAG, "Raw capture: %s", buf);
     if (this->last_event_text_sensor_ != nullptr)
       this->last_event_text_sensor_->publish_state(buf);

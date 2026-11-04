@@ -36,15 +36,18 @@ class SystimerGuard : public PollingComponent {
   static void task_entry_(void *arg);
   void run_();
   void write_canary_();
-  void record_capture_(int64_t delta_us, uint64_t timer_before, uint64_t timer_after, uint64_t tick_before,
-                       uint64_t tick_after);
+  enum class EventKind : uint8_t { LOST, AHEAD, TICK_LOST };
+  void record_capture_(EventKind kind, int64_t delta_us, uint64_t timer_before, uint64_t timer_after,
+                       uint64_t tick_before, uint64_t tick_after, int64_t rtc_us);
 
   // Raw SYSTIMER values around one event, for espressif/esp-idf#19036.
   struct Capture {
-    int64_t delta_us;                    // > 0: esp_timer lost this much; < 0: it jumped ahead
+    EventKind kind;
+    int64_t delta_us;                    // how far the counter moved the wrong way
     uint64_t timer_before, timer_after;  // counter 0 (esp_timer), ticks
     uint64_t tick_before, tick_after;    // counter 1 (FreeRTOS tick), ticks
     uint64_t load;                       // counter 0 load registers, before the guard writes them
+    int64_t rtc_us;                      // time between the two checks by the RTC timer
   };
 
   uint32_t threshold_us_{2000};
