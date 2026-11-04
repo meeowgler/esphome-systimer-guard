@@ -5,7 +5,7 @@ An ESPHome external component that works around the ESP32-C6 SYSTIMER fault desc
 the counter behind `esp_timer` (SYSTIMER counter 0) suddenly loses minutes to hours, and its
 snapshot handshake can wedge.
 
-**Status: experimental.** It has corrected one real fault so far (see [Results](#results)).
+**Status: experimental.** It has corrected 13 real events on 3 boards so far (see [Results](#results)).
 Use it only if your C6 boards show the symptoms below, and please report how it behaves.
 
 ## Related work
@@ -42,9 +42,24 @@ never be larger than the counter's own value.
   running (ESPHome logs a refused setting only at verbose level, so this needed checking). So on
   this board modem sleep is not the trigger; turning it off only avoids the Wi-Fi hang described
   under [Limits](#limits).
-- **To 28 October 2026:** 4 real events on 2 of 12 boards since the guard went on all of them
-  on 25 October, all corrected; no stalls, no snapshot recoveries, and counter 1 never moved
-  backward.
+- **30 October 2026:** a third board, which had stalled once before the guard, lost 205.521 s,
+  bits 26, 30 and 31. The worst board lost 71.303 s (bits 26 and 30), and the 27 October board
+  0.491 s (bits 19 to 22).
+- **31 October 2026, the largest so far:** the worst board lost 244813.13 s (68.0 hours), bits
+  36, 39, 40 and 41. Without the guard it would have gone quiet for almost three days. Going by
+  its uptime at the time (about 253,600 s), bit 37 was also set and survived, so this was not a
+  whole bit group cleared. That is worked out from the loss, not from a raw capture.
+- **2 November 2026:** the worst board had five events, of about 4.20 s, 2998.91 s, 2.92 s,
+  2.09 s and 1858.06 s. Their bits can't be named: these losses come from the `time_recovered`
+  total, a 32-bit float that only resolves about 0.02 s once it passes 245,000 s. The
+  `last_event` sensor records exact raw values instead.
+- **Below bit 26:** the 4.079 s and 0.491 s events lie entirely below bit 26, outside the two
+  bit groups (26 to 35 and 36 to 51) seen in the raw captures on the upstream issue.
+- **To 3 November 2026:** 13 real events on 3 of 12 boards since the guard went on all of them
+  on 25 October, all corrected; 10 were on the worst board, 8 of those with power saving off.
+  No stalls, no snapshot recoveries, and counter 1 never moved backward.
+- **Since 3 November 2026** the worst board runs with `load_canary` and `last_event` (see
+  [Options](#options)), to record raw values for the upstream issue.
 - Simulated 600 s jumps (see [Testing it](#testing-it)) are corrected to the millisecond.
 - A simulated wedged handshake (`simulate_wedge()`) ends in an abort about a second later, and
   the board restarts with an `Abort` crash record and reset reason "exception/panic".
