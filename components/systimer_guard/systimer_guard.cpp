@@ -1,6 +1,8 @@
 #include "systimer_guard.h"
 
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -28,6 +30,11 @@ static const int SNAPSHOT_POLLS = 250;
 static const int SNAPSHOT_REQUESTS = 4;
 // Consecutive failed checks (one per millisecond) before the guard gives up and aborts.
 static const uint32_t WEDGE_ABORT_CHECKS = 1000;
+// Pattern Espressif asked affected boards to keep in counter 0's load registers. A fault that
+// spuriously loads part of the counter would then copy this pattern in instead of zeros.
+static const uint64_t LOAD_CANARY = (0x5A5A5ULL << 32) | 0xA5A5A5A5ULL;
+// SYSTIMER counters are 52 bits wide.
+static const uint64_t COUNTER_MASK = (1ULL << 52) - 1;
 
 enum class ReadResult { OK, RECOVERED, FAILED };
 
@@ -65,23 +72,36 @@ static inline ReadResult read_counter_ticks(uint32_t counter, uint64_t *ticks) {
 // Reads both counters back to back with interrupts off, tick counter first. A delay between
 // the two reads can then only make esp_timer look AHEAD, never behind, so it cannot cause a
 // false correction. esp_timer_get_time() is exactly systimer_ticks_to_us(counter 0).
-// Gives esp_timer minus the tick counter, in microseconds.
-static ReadResult read_offset(int64_t *offset_us, uint64_t *tick_us) {
-  uint64_t tick_ticks = 0, timer_ticks = 0;
+// Gives esp_timer minus the tick counter, in microseconds, and both raw counters in ticks.
+static ReadResult read_offset(int64_t *offset_us, uint64_t *tick_us, uint64_t *tick_ticks, uint64_t *timer_ticks) {
   portENTER_CRITICAL(&s_read_lock);
-  ReadResult tick = read_counter_ticks(SYSTIMER_COUNTER_OS_TICK, &tick_ticks);
+  ReadResult tick = read_counter_ticks(SYSTIMER_COUNTER_OS_TICK, tick_ticks);
   ReadResult timer = tick == ReadResult::FAILED ? ReadResult::FAILED
-                                                : read_counter_ticks(SYSTIMER_COUNTER_ESPTIMER, &timer_ticks);
+                                                : read_counter_ticks(SYSTIMER_COUNTER_ESPTIMER, timer_ticks);
   portEXIT_CRITICAL(&s_read_lock);
   if (tick == ReadResult::FAILED || timer == ReadResult::FAILED)
     return ReadResult::FAILED;
-  *tick_us = systimer_ticks_to_us(tick_ticks);
-  *offset_us = int64_t(systimer_ticks_to_us(timer_ticks)) - int64_t(*tick_us);
+  *tick_us = systimer_ticks_to_us(*tick_ticks);
+  *offset_us = int64_t(systimer_ticks_to_us(*timer_ticks)) - int64_t(*tick_us);
   return (tick == ReadResult::RECOVERED || timer == ReadResult::RECOVERED) ? ReadResult::RECOVERED
                                                                            : ReadResult::OK;
 }
 
+// Counter 0's load registers: what the counter would take on an "apply". Only
+// esp_timer_private_advance() writes them (it loads the advanced value and applies it).
+static uint64_t read_load_value() {
+  return (uint64_t(SYSTIMER.unit_load_val[SYSTIMER_COUNTER_ESPTIMER].hi.timer_unit_load_hi) << 32) |
+         SYSTIMER.unit_load_val[SYSTIMER_COUNTER_ESPTIMER].lo.timer_unit_load_lo;
+}
+
 static void kick_cb(void *arg) {}
+
+// Writes the pattern into counter 0's load registers without applying it, so the counter is
+// not touched. Every esp_timer_private_advance() overwrites them, so this follows each one.
+void SystimerGuard::write_canary_() {
+  if (this->load_canary_)
+    systimer_ll_set_counter_value(&SYSTIMER, SYSTIMER_COUNTER_ESPTIMER, LOAD_CANARY);
+}
 
 void SystimerGuard::setup() {
   // A one-shot esp_timer started right after a correction re-arms the esp_timer alarm, so
@@ -94,6 +114,7 @@ void SystimerGuard::setup() {
     this->mark_failed();
     return;
   }
+  this->write_canary_();
   // Highest priority, so after a jump the guard runs at the next tick (within 1 ms), before
   // other tasks can schedule work against the wrong time. Each check takes a few microseconds.
   if (xTaskCreate(SystimerGuard::task_entry_, "systimer_guard", 2560, this, configMAX_PRIORITIES - 1, nullptr) !=
@@ -111,6 +132,7 @@ void SystimerGuard::run_() {
   // offset. Take the smallest offset seen as the true one (read delays only add to it).
   int64_t base = INT64_MAX;
   uint64_t prev_tick_us = 0;
+  uint64_t prev_tick_ticks = 0, prev_timer_ticks = 0;
   uint64_t last_correction_tick_us = 0;
   uint32_t failed_checks = 0;
   const int64_t threshold = this->threshold_us_;
@@ -118,9 +140,10 @@ void SystimerGuard::run_() {
   for (;;) {
     vTaskDelay(period);
     int64_t offset;
-    uint64_t tick_us;
-    ReadResult read = this->simulate_wedge_.load(std::memory_order_relaxed) ? ReadResult::FAILED
-                                                                             : read_offset(&offset, &tick_us);
+    uint64_t tick_us, tick_ticks, timer_ticks;
+    ReadResult read = this->simulate_wedge_.load(std::memory_order_relaxed)
+                          ? ReadResult::FAILED
+                          : read_offset(&offset, &tick_us, &tick_ticks, &timer_ticks);
     if (read == ReadResult::FAILED) {
       // The handshake stays wedged: every other esp_timer reader is spinning on it too, so the
       // board is stuck until a watchdog fires. Abort sooner, without logging (the logger reads
@@ -137,6 +160,8 @@ void SystimerGuard::run_() {
       this->tick_counter_jumps_.fetch_add(1, std::memory_order_relaxed);
       base = offset;
       prev_tick_us = tick_us;
+      prev_tick_ticks = tick_ticks;
+      prev_timer_ticks = timer_ticks;
       continue;
     }
     prev_tick_us = tick_us;
@@ -145,12 +170,16 @@ void SystimerGuard::run_() {
     } else if (base - offset > threshold) {
       // esp_timer lost time (jumped back or stopped): step it forward by exactly that much.
       int64_t lost = base - offset;
-      esp_timer_private_advance(lost);
-      esp_timer_start_once(this->kick_timer_, 1);
       // Corrections less than a second apart are one event (a counter that stops rather than
       // jumps is stepped forward every few milliseconds until it runs again).
+      bool new_event = last_correction_tick_us == 0 || tick_us - last_correction_tick_us > 1000000;
+      if (new_event)
+        this->record_capture_(lost, prev_timer_ticks, timer_ticks, prev_tick_ticks, tick_ticks);
+      esp_timer_private_advance(lost);
+      this->write_canary_();
+      esp_timer_start_once(this->kick_timer_, 1);
       uint32_t lost_ms = uint32_t(lost / 1000);
-      if (last_correction_tick_us == 0 || tick_us - last_correction_tick_us > 1000000) {
+      if (new_event) {
         this->last_jump_ms_.store(lost_ms, std::memory_order_relaxed);
         this->corrections_.fetch_add(1, std::memory_order_relaxed);
       } else {
@@ -159,10 +188,22 @@ void SystimerGuard::run_() {
       last_correction_tick_us = tick_us;
       this->recovered_ms_.fetch_add(lost_ms, std::memory_order_relaxed);
     } else if (offset - base > threshold) {
-      // esp_timer ahead of the tick counter: not the known fault. Re-learn rather than act.
+      // esp_timer ahead of the tick counter: not the known fault. Re-learn rather than act, but
+      // record it (a spurious load of the canary could move the counter forward).
+      this->record_capture_(base - offset, prev_timer_ticks, timer_ticks, prev_tick_ticks, tick_ticks);
       base = offset;
     }
+    prev_tick_ticks = tick_ticks;
+    prev_timer_ticks = timer_ticks;
   }
+}
+
+void SystimerGuard::record_capture_(int64_t delta_us, uint64_t timer_before, uint64_t timer_after,
+                                    uint64_t tick_before, uint64_t tick_after) {
+  if (timer_before == 0 || this->capture_pending_.load(std::memory_order_acquire))
+    return;  // no earlier reading yet, or the last capture is not reported yet
+  this->capture_ = Capture{delta_us, timer_before, timer_after, tick_before, tick_after, read_load_value()};
+  this->capture_pending_.store(true, std::memory_order_release);
 }
 
 void SystimerGuard::loop() {
@@ -187,6 +228,22 @@ void SystimerGuard::loop() {
     ESP_LOGW(TAG, "A counter snapshot had to be re-requested (%" PRIu32 " times)", recoveries);
     this->logged_snapshot_recoveries_ = recoveries;
     this->update();
+  }
+  if (this->capture_pending_.load(std::memory_order_acquire)) {
+    const Capture c = this->capture_;
+    this->capture_pending_.store(false, std::memory_order_release);
+    // Counter 0 should have moved exactly as far as counter 1 between the two readings; the
+    // XOR shows which bits differ from that (the lowest few also carry the read delay).
+    uint64_t expected = (c.timer_before + (c.tick_after - c.tick_before)) & COUNTER_MASK;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "%s %.3f s; u0 0x%013" PRIx64 " -> 0x%013" PRIx64 "; u1 0x%013" PRIx64 " -> 0x%013" PRIx64
+             "; load 0x%013" PRIx64 "; xor 0x%013" PRIx64,
+             c.delta_us >= 0 ? "lost" : "ahead", std::llabs(c.delta_us) / 1e6, c.timer_before, c.timer_after,
+             c.tick_before, c.tick_after, c.load, expected ^ c.timer_after);
+    ESP_LOGW(TAG, "Raw capture: %s", buf);
+    if (this->last_event_text_sensor_ != nullptr)
+      this->last_event_text_sensor_->publish_state(buf);
   }
 }
 
@@ -214,6 +271,7 @@ void SystimerGuard::simulate_jump(uint32_t seconds) {
   }
   ESP_LOGW(TAG, "Test: stepping esp_timer back %.1f s", step / 1e6f);
   esp_timer_private_advance(-step);
+  this->write_canary_();
 }
 
 void SystimerGuard::simulate_wedge() {
@@ -225,12 +283,14 @@ void SystimerGuard::dump_config() {
   ESP_LOGCONFIG(TAG,
                 "SYSTIMER guard:\n"
                 "  Running: %s\n"
-                "  Threshold: %" PRIu32 " us",
-                YESNO(this->running_), this->threshold_us_);
+                "  Threshold: %" PRIu32 " us\n"
+                "  Load canary: %s (load registers now 0x%013" PRIx64 ")",
+                YESNO(this->running_), this->threshold_us_, YESNO(this->load_canary_), read_load_value());
   LOG_SENSOR("  ", "Corrections", this->corrections_sensor_);
   LOG_SENSOR("  ", "Time recovered", this->time_recovered_sensor_);
   LOG_SENSOR("  ", "Tick counter jumps", this->tick_counter_jumps_sensor_);
   LOG_SENSOR("  ", "Snapshot recoveries", this->snapshot_recoveries_sensor_);
+  LOG_TEXT_SENSOR("  ", "Last event", this->last_event_text_sensor_);
 }
 
 }  // namespace esphome::systimer_guard

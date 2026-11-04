@@ -140,6 +140,18 @@ systimer_guard:
   would mean the fault is not limited to counter 0.
 - **snapshot_recoveries** (*Optional*, sensor): reads that only succeeded after the snapshot
   was re-requested.
+- **last_event** (*Optional*, text sensor): the raw values around the latest event: counter 0
+  and counter 1 at the check before and the check that caught it, counter 0's load registers,
+  and which bits of counter 0 differ from where it should be (the XOR; its lowest few bits also
+  carry the read delay). Each event is logged as a warning too, as `Raw capture: ...`.
+- **load_canary** (*Optional*, boolean, default `false`): keep the pattern `0x5A5A5A5A5A5A5`
+  in counter 0's load registers, as Espressif asked in
+  [esp-idf#19036](https://github.com/espressif/esp-idf/issues/19036). If an event loads part of
+  the counter from those registers rather than clearing it, the pattern shows up in the counter.
+  The registers are written without being applied, so the counter itself is not touched; the
+  guard rewrites the pattern after each correction, since `esp_timer_private_advance()` uses the
+  same registers. A spurious load can move the clock forward, which the guard records but does
+  not undo.
 
 Each event is also logged as a warning:
 

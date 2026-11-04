@@ -3,6 +3,7 @@
 #include <atomic>
 #include <esp_timer.h>
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
 
 namespace esphome::systimer_guard {
@@ -22,6 +23,8 @@ class SystimerGuard : public PollingComponent {
   void set_time_recovered_sensor(sensor::Sensor *s) { this->time_recovered_sensor_ = s; }
   void set_tick_counter_jumps_sensor(sensor::Sensor *s) { this->tick_counter_jumps_sensor_ = s; }
   void set_snapshot_recoveries_sensor(sensor::Sensor *s) { this->snapshot_recoveries_sensor_ = s; }
+  void set_last_event_text_sensor(text_sensor::TextSensor *s) { this->last_event_text_sensor_ = s; }
+  void set_load_canary(bool load_canary) { this->load_canary_ = load_canary; }
 
   /// Test hook: step esp_timer back by `seconds`, the way the SYSTIMER fault does.
   void simulate_jump(uint32_t seconds);
@@ -32,12 +35,25 @@ class SystimerGuard : public PollingComponent {
  protected:
   static void task_entry_(void *arg);
   void run_();
+  void write_canary_();
+  void record_capture_(int64_t delta_us, uint64_t timer_before, uint64_t timer_after, uint64_t tick_before,
+                       uint64_t tick_after);
+
+  // Raw SYSTIMER values around one event, for espressif/esp-idf#19036.
+  struct Capture {
+    int64_t delta_us;                    // > 0: esp_timer lost this much; < 0: it jumped ahead
+    uint64_t timer_before, timer_after;  // counter 0 (esp_timer), ticks
+    uint64_t tick_before, tick_after;    // counter 1 (FreeRTOS tick), ticks
+    uint64_t load;                       // counter 0 load registers, before the guard writes them
+  };
 
   uint32_t threshold_us_{2000};
   sensor::Sensor *corrections_sensor_{nullptr};
   sensor::Sensor *time_recovered_sensor_{nullptr};
   sensor::Sensor *tick_counter_jumps_sensor_{nullptr};
   sensor::Sensor *snapshot_recoveries_sensor_{nullptr};
+  text_sensor::TextSensor *last_event_text_sensor_{nullptr};
+  bool load_canary_{false};
   esp_timer_handle_t kick_timer_{nullptr};
   bool running_{false};
 
@@ -48,6 +64,10 @@ class SystimerGuard : public PollingComponent {
   std::atomic<uint32_t> tick_counter_jumps_{0};
   std::atomic<uint32_t> snapshot_recoveries_{0};  // reads that needed the snapshot re-requested
   std::atomic<bool> simulate_wedge_{false};
+  // The guard task fills capture_ only while capture_pending_ is false; the main loop reports
+  // it and clears the flag.
+  Capture capture_{};
+  std::atomic<bool> capture_pending_{false};
   uint32_t logged_corrections_{0};
   uint32_t logged_tick_counter_jumps_{0};
   uint32_t logged_snapshot_recoveries_{0};

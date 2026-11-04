@@ -8,7 +8,7 @@ aborts so the board restarts with a crash record.
 """
 
 import esphome.codegen as cg
-from esphome.components import sensor
+from esphome.components import sensor, text_sensor
 from esphome.components.esp32 import VARIANT_ESP32C6, only_on_variant
 import esphome.config_validation as cv
 from esphome.const import (
@@ -20,13 +20,15 @@ from esphome.const import (
 )
 
 CODEOWNERS = []
-AUTO_LOAD = ["sensor"]
+AUTO_LOAD = ["sensor", "text_sensor"]
 
 CONF_THRESHOLD = "threshold"
 CONF_CORRECTIONS = "corrections"
 CONF_TIME_RECOVERED = "time_recovered"
 CONF_TICK_COUNTER_JUMPS = "tick_counter_jumps"
 CONF_SNAPSHOT_RECOVERIES = "snapshot_recoveries"
+CONF_LAST_EVENT = "last_event"
+CONF_LOAD_CANARY = "load_canary"
 
 systimer_guard_ns = cg.esphome_ns.namespace("systimer_guard")
 SystimerGuard = systimer_guard_ns.class_("SystimerGuard", cg.PollingComponent)
@@ -60,6 +62,11 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_TICK_COUNTER_JUMPS): _count_sensor("mdi:clock-alert"),
             cv.Optional(CONF_SNAPSHOT_RECOVERIES): _count_sensor("mdi:clock-check-outline"),
+            cv.Optional(CONF_LAST_EVENT): text_sensor.text_sensor_schema(
+                icon="mdi:clock-alert-outline",
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            cv.Optional(CONF_LOAD_CANARY, default=False): cv.boolean,
         }
     ).extend(cv.polling_component_schema("60s")),
     cv.only_with_framework("esp-idf"),
@@ -71,6 +78,7 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_threshold_us(config[CONF_THRESHOLD].total_microseconds))
+    cg.add(var.set_load_canary(config[CONF_LOAD_CANARY]))
     for key, setter in (
         (CONF_CORRECTIONS, var.set_corrections_sensor),
         (CONF_TIME_RECOVERED, var.set_time_recovered_sensor),
@@ -79,3 +87,5 @@ async def to_code(config):
     ):
         if key in config:
             cg.add(setter(await sensor.new_sensor(config[key])))
+    if CONF_LAST_EVENT in config:
+        cg.add(var.set_last_event_text_sensor(await text_sensor.new_text_sensor(config[CONF_LAST_EVENT])))
