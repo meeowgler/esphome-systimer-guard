@@ -5,7 +5,7 @@ An ESPHome external component that works around the ESP32-C6 SYSTIMER fault desc
 the counter behind `esp_timer` (SYSTIMER counter 0) suddenly loses minutes to hours, and its
 snapshot handshake can wedge.
 
-**Status: experimental.** It has corrected 16 real events on 3 boards so far (see [Results](#results)).
+**Status: experimental.** It has corrected 21 real events on 3 boards so far (see [Results](#results)).
 Use it only if your C6 boards show the symptoms below, and please report how it behaves.
 
 ## Related work
@@ -73,9 +73,14 @@ never be larger than the counter's own value.
   went backward. The first lost exactly bits 15 and 19 (557,056 ticks, to within 80 ticks); the
   second about 94 ms, which fits bits 0 to 20 cleared. Since 4 November the guard reads the RTC
   timer as a third clock to tell the two cases apart, and counts these as tick counter jumps.
-- **To 4 November 2026:** 16 real events on counter 0 on 3 of 12 boards since the guard went on
-  all of them on 25 October, all corrected; 13 were on the worst board. Counter 1 lost time
-  twice, both on the worst board. No stalls and no snapshot recoveries.
+- **5 November 2026, all on the worst board.** Counter 0 lost time five times. Four were whole
+  groups: 2118.124 s, 2755.658 s, 1975.517 s and 2378.170 s, each with bits 26 to 35 all
+  cleared and the canary absent. The fifth, 1.049 s, cleared only bit 24: the first raw capture
+  of an event below bit 26. Counter 1 lost 66 ms, 123 ms and 46 ms, and the RTC check named
+  all three correctly (the RTC timer measured 66.7, 124.0 and 46.6 ms between the two checks).
+- **To 5 November 2026:** 21 real events on counter 0 on 3 of 12 boards since the guard went on
+  all of them on 25 October, all corrected; 18 were on the worst board. Counter 1 lost time
+  five times, all on the worst board. No stalls and no snapshot recoveries.
 
   The raw captures (counter values in 16 MHz ticks):
 
@@ -85,6 +90,14 @@ never be larger than the counter's own value.
   lost 4261.413 s; u0 0x0008fe3bc4452 -> 0x0008003bc826f; u1 0x0008fe3bbc1bc -> 0x0008fe3bc0016; load 0x5a5a5a5a5a5a5
   ahead 0.035 s;   u0 0x000ef9fe908a1 -> 0x000ef9ff1c789; u1 0x000ef9fe88795 -> 0x000ef9fe8c62d; load 0x5a5a5a5a5a5a5
   ahead 0.094 s;   u0 0x000fa551fb884 -> 0x000fa5536da36; u1 0x000fa5516b796 -> 0x000fa5516f68b; load 0x5a5a5a5a5a5a5
+  lost 2118.124 s; u0 0x00067e56a8283 -> 0x00060016ac1dc; u1 0x00067e569fd97 -> 0x00067e56a3cd6; load 0x5a5a5a5a5a5a5
+  tick counter lost 0.066 s; u0 0x0000a2e12d1c8 -> 0x0000a2e232112; u1 0x0000a2e124c97 -> 0x0000a2e128b6a; rtc 66.7 ms
+  tick counter lost 0.123 s; u0 0x0000c9eeea2d5 -> 0x0000c9f0cf40c; u1 0x0000c9ede0d97 -> 0x0000c9ede4c6b; rtc 124.0 ms
+  lost 2755.658 s; u0 0x0001a44dfa697 -> 0x0001000dfe516; u1 0x0001a44b0ff97 -> 0x0001a44b13e16; load 0x5a5a5a5a5a5a5
+  lost 1975.517 s; u0 0x000275fda2955 -> 0x0002003da67d5; u1 0x000275fab8296 -> 0x000275fabc117; load 0x5a5a5a5a5a5a5
+  lost 2378.170 s; u0 0x00048def1cb02 -> 0x0004002f20943; u1 0x00048dec324aa -> 0x00048dec36317; load 0x5a5a5a5a5a5a5
+  tick counter lost 0.046 s; u0 0x0004f9b79c5d2 -> 0x0004f9b852688; u1 0x0004f9b4b1fca -> 0x0004f9b4b5e1f; rtc 46.6 ms
+  lost 1.049 s;    u0 0x00069d943d2b4 -> 0x00069d844111f; u1 0x00069d90a0b16 -> 0x00069d90a49ab; load 0x5a5a5a5a5a5a5
   ```
 - Simulated 600 s jumps (see [Testing it](#testing-it)) are corrected to the millisecond.
 - A simulated wedged handshake (`simulate_wedge()`) ends in an abort about a second later, and
